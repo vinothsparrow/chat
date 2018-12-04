@@ -16,18 +16,17 @@ Fields:
 * `State` currently unused
 * `LastSeen` timestamp when the user was last online
 * `UserAgent` client User-Agent used when last online
-* `SeqId` last message id on user's 'me' topics
-* `ClearId` maximum message id that's been cleared (deleted)
 * `Tags` unique strings for user discovery
 * `Devices` client devices for push notifications
  * `DeviceId` device registration ID
- * `Platform` device platform (iOS, Android, Web)
+ * `Platform` device platform string (iOS, Android, Web)
  * `LastSeen` last logged in
  * `Lang` device language, ISO code
 
 Indexes:
  * `Id` primary key
  * `Tags` multi-index (indexed array)
+ * `DeviceIds` multi-index of push notification tokens
 
 Sample:
 ```js
@@ -36,7 +35,6 @@ Sample:
     "Anon": 0 ,
     "Auth": 47
   } ,
-  "ClearId": 0 ,
   "CreatedAt": Mon Jul 24 2017 11:16:38 GMT+00:00 ,
   "DeletedAt": null ,
   "Devices": null ,
@@ -49,7 +47,6 @@ Sample:
       "type": "jpg"
     }
   } ,
-  "SeqId": 0 ,
   "State": 1 ,
   "Tags": [
     "email:alice@example.com" ,
@@ -84,14 +81,14 @@ Sample:
    "unique": "basic:alice" ,
    "userid": "7yUCHniegrM"
 }
- ```
+```
 
 ### Table `tagunique`
 Indexed user tags, mostly to ensure tag uniqueness
 
 Fields:
-`Id` unique tag, primary keys
-`Source` ID of the user who owns the tag
+* `Id` unique tag, primary keys
+* `Source` ID of the user who owns the tag
 
 Indexes:
 
@@ -115,8 +112,8 @@ Fields:
   * `Auth`, `Anon` permissions for authenticated and anonymous users respectively
  * `Public` application-defined data
  * `State` currently unused
- * `SeqId` id of the last message
- * `ClearId` id of the message last cleared (deleted)
+ * `SeqId` sequential ID of the last message
+ * `DelId` topic-sequential ID of the deletion operation
  * `UseBt` currently unused
 
 Indexes:
@@ -129,7 +126,7 @@ Sample:
   "Anon": 64 ,
   "Auth": 64
  } ,
- "ClearId": 0,
+ "DelId": 0,
  "CreatedAt": Thu Oct 15 2015 04:06:51 GMT+00:00 ,
  "DeletedAt": null ,
  "LastMessageAt": Sat Oct 17 2015 13:51:56 GMT+00:00 ,
@@ -158,7 +155,7 @@ Fields:
  * `DeletedAt` currently unused
  * `ReadSeqId` id of the message last read by the user
  * `RecvSeqId` id of the message last received by user device
- * `ClearedId` user soft-deleted messages with id lower or equal to this id
+ * `DelId` topic-sequential ID of the soft-deletion operation
  * `Topic` name of the topic subscribed to
  * `User` subscriber's user ID
  * `ModeWant` access mode that user wants when accessing the topic
@@ -190,18 +187,18 @@ Sample:
 ```
 
 ### Table `messages`
-
 The table stores `{data}` messages
 
 Fields:
 * `Id` currently unused, primary key
 * `CreatedAt` timestamp when the message was created
-* `UpdatedAt` unused, created for consistency
-* `DeletedAt` timestamp when the message was deleted for all users
-* `DeletedFor` IDs of the users who have deleted the message
+* `UpdatedAt` initially equal to CreatedAt, for deleted messages equal to DeletedAt
+* `DeletedFor` array of user IDs which soft-deleted the message
+ * `DelId` topic-sequential ID of the soft-deletion operation
+ * `User` ID of the user who soft-deleted the message
 * `From` ID of the user who generated this message
 * `Topic` which received this message
-* `SeqId` id of the message
+* `SeqId` messages ID - sequential number of the message in the topic
 * `Head` message headers
 * `Content` application-defined message payload
 
@@ -212,15 +209,128 @@ Indexes:
 Sample:
 ```js
 {
-  "Content":  "Signs point to yes" ,
-  "CreatedAt": Thu Jul 27 2017 14:49:44 GMT+00:00 ,
-  "DeletedAt": null ,
-  "DeletedFor": [ ],
-  "From":  "7yUCHniegrM" ,
-  "Head": null ,
-  "Id":  "5b6vNnjmpFM" ,
-  "SeqId": 7 ,
-  "Topic":  "p2pTDqwKVw-jLDvJQIeeJ6Csw" ,
-  "UpdatedAt": Thu Jul 27 2017 14:49:44 GMT+00:00
+  "Content": {
+    "fmt": [
+      {
+        "len": 6 ,
+        "tp":  "ST"
+      }
+    ] ,
+    "txt":  "Hello!"
+  } ,
+  "CreatedAt": Sun Dec 24 2017 05:16:23 GMT+00:00 ,
+  "From":  "wTI0jO9rEqY" ,
+  "Head": {
+    "mime":  "text/x-drafty"
+  } ,
+  "DeletedFor": [
+    {
+      "DelId": 1 ,
+      "User":  "wTI0jO9rEqY"
+    }
+  ] ,
+  "Id":  "LLXKEe9W4Bs" ,
+  "SeqId": 3 ,
+  "Topic":  "p2pJhbJnya8z5PBMjSM72sSpg" ,
+  "UpdatedAt": Sun Dec 24 2017 05:16:23 GMT+00:00
+}
+```
+
+### Table `dellog`
+The table stores records of message deletions
+
+Fields:
+* `Id` currently unused, primary key
+* `CreatedAt` timestamp when the record was created
+* `UpdatedAt` timestamp equal to CreatedAt
+* `DelId` topic-sequential ID of the deletion operation.
+* `DeletedFor` ID of the user for soft-deletions, blank string for hard-deletions
+* `Topic` affected topic
+* `SeqIdRanges` array of ranges of deleted message IDs (see `messages.SeqId`)
+
+Indexes:
+* `Topic_DelId` compound index `["Topic", "DelId"]`
+
+Sample:
+```js
+{
+  "Id":  "9LfrjW349Rc",
+  "CreatedAt": Tue Dec 05 2017 01:51:38 GMT+00:00,
+  "DelId": 18,
+  "DeletedFor": "xY-YHx09-WI" ,
+
+  "SeqIdRanges": [
+    {
+      "Low": 20,
+      "Hi": 25,
+    }
+  ] ,
+  "Topic":  "grpGx7fpjQwVC0" ,
+  "UpdatedAt": Tue Dec 05 2017 01:51:38 GMT+00:00
+}
+```
+
+### Table `credentials`
+The tables stores user credentials used for validation.
+
+* `Id` unique credential, primary key
+* `CreatedAt` timestamp when the record was created
+* `UpdatedAt` timestamp when the last validation attempt was performed (successful or not).
+* `Method` validation method
+* `Done` indicator if the credential is validated
+* `Resp` expected validation response
+* `Retries` number of failed attempts at validation
+* `User` id of the user who owns this credential
+* `Value` value of the credential
+
+Indexes:
+* `Id` Primary key composed either as `User`:`Method`:`Value` for unconfirmed credentials or as `Method`:`Value` for confirmed.
+* `User` Index
+
+Sample:
+```js
+{
+  "Id": "tel:17025550001",
+  "CreatedAt": Sun Jun 10 2018 16:37:27 GMT+00:00 ,
+  "Method":  "tel" ,
+  "Done": true ,
+  "Resp":  "123456" ,
+  "Retries": 0 ,
+  "UpdatedAt": Sun Jun 10 2018 16:37:27 GMT+00:00 ,
+  "User":  "k3srBRk9RYw" ,
+  "Value":  "17025550001"
+}
+```
+
+### Table `fileuploads`
+The table stores records of uploaded files. The files themselves are stored outside of the database.
+* `Id` unique user-visible file name, primary key
+* `CreatedAt` timestamp when the record was created
+* `UpdatedAt` timestamp of when th upload has cmpleted or failed
+* `User` id of the user who uploaded this file.
+* `Location` actual location of the file on the server.
+* `MimeType` file content type as a [Mime](https://en.wikipedia.org/wiki/MIME) string.
+* `Size` size of the file in bytes. Could be 0 if upload has not completed yet.
+* `UseCount` count of messages referencing this file.
+* `Status` upload status: 0 pending, 1 completed, -1 failed.
+
+Indexes:
+ * `Id` file name, primary key
+ * `User` index
+ * `Topic_SeqId` compound index `["Topic", "SeqId"]`
+ * `UseCount` index
+
+Sample:
+```js
+{
+  "CreatedAt": Sun Jun 10 2018 16:38:45 GMT+00:00 ,
+  "Id":  "sFmjlQ_kA6A" ,
+  "Location":  "uploads/sFmjlQ_kA6A" ,
+  "MimeType":  "image/jpeg" ,
+  "Size": 54961090 ,
+  "UseCount": 3,
+  "Status": 1 ,
+  "UpdatedAt": Sun Jun 10 2018 16:38:45 GMT+00:00 ,
+  "User":  "7j-RR1V7O3Y"
 }
 ```

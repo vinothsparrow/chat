@@ -10,34 +10,37 @@ import (
 	t "github.com/tinode/chat/server/store/types"
 )
 
-type PushTo struct {
-	// Addresse
+// Recipient is a user targeted by the push.
+type Recipient struct {
+	// Addressee
 	User t.Uid `json:"user"`
 	// Count of user's connections that were live when the packet was dispatched from the server
-	Delieved int `json:"delivered"`
+	Delivered int `json:"delivered"`
 	// List of user's devices that the packet was delivered to (if known). Len(Devices) >= Delivered
 	Devices []string `json:"devices,omitempty"`
 }
 
+// Receipt is the push payload with a list of recipients.
 type Receipt struct {
-	// List of recepients, including those who did not receive the message
-	To []PushTo `json:"to"`
+	// List of recipients, including those who did not receive the message
+	To []Recipient `json:"to"`
 	// Actual content to be delivered to the client
 	Payload Payload `json:"payload"`
 }
 
+// Payload is content of the push.
 type Payload struct {
-	Topic string `json:"topic"`
-	// Google is retarded. "from" is a reserved keyword in FCM
-	From      string    `json:"xfrom"`
-	Timestamp time.Time `json:"ts"`
-	SeqId     int       `json:"seq"`
+	Topic       string    `json:"topic"`
+	From        string    `json:"from"`
+	Timestamp   time.Time `json:"ts"`
+	SeqId       int       `json:"seq"`
+	ContentType string    `json:"mime"`
 	// Actual Data.Content of the message, if requested
 	Content interface{} `json:"content,omitempty"`
 }
 
-// PushHandler is an interface which must be implemented by handlers.
-type PushHandler interface {
+// Handler is an interface which must be implemented by handlers.
+type Handler interface {
 	// Initialize the handler
 	Init(jsonconf string) error
 
@@ -57,12 +60,12 @@ type configType struct {
 	Config json.RawMessage `json:"config"`
 }
 
-var handlers map[string]PushHandler
+var handlers map[string]Handler
 
 // Register a push handler
-func Register(name string, hnd PushHandler) {
+func Register(name string, hnd Handler) {
 	if handlers == nil {
-		handlers = make(map[string]PushHandler)
+		handlers = make(map[string]Handler)
 	}
 
 	if hnd == nil {
@@ -74,7 +77,7 @@ func Register(name string, hnd PushHandler) {
 	handlers[name] = hnd
 }
 
-// Initialize registered handlers
+// Init initializes registered handlers.
 func Init(jsconfig string) error {
 	var config []configType
 

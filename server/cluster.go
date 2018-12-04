@@ -1,54 +1,65 @@
 package main
 
 import (
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"log"
 	"net"
 	"net/rpc"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/tinode/chat/server/auth"
 	rh "github.com/tinode/chat/server/ringhash"
 	"github.com/tinode/chat/server/store/types"
 )
 
-const DEFAULT_CLUSTER_RECONNECT = 1000 * time.Millisecond
-const CLUSTER_HASH_REPLICAS = 20
+const (
+	// Default timeout before attempting to reconnect to a node
+	defaultClusterReconnect = 200 * time.Millisecond
+	// Number of replicas in ringhash
+	clusterHashReplicas = 20
+)
 
-type ClusterNodeConfig struct {
+type clusterNodeConfig struct {
 	Name string `json:"name"`
 	Addr string `json:"addr"`
 }
 
-type ClusterConfig struct {
+type clusterConfig struct {
 	// List of all members of the cluster, including this member
-	Nodes []ClusterNodeConfig `json:"nodes"`
+	Nodes []clusterNodeConfig `json:"nodes"`
 	// Name of this cluster node
 	ThisName string `json:"self"`
-	// Address:Port to listen on for incoming requests
-	ListenOn string `json:"listen"`
+	// Failover configuration
+	Failover *clusterFailoverConfig
 }
 
+// ClusterNode is a client's connection to another node.
 type ClusterNode struct {
 	lock sync.Mutex
 
 	// RPC endpoint
 	endpoint *rpc.Client
-	// true if the endpoint is believed to be connected
+	// True if the endpoint is believed to be connected
 	connected bool
-	// Error returned by the last call, could be nil
-	lastError error
+	// True if a go routine is trying to reconnect the node
+	reconnecting bool
 	// TCP address in the form host:port
 	address string
 	// Name of the node
 	name string
 
-	// signals to shut down the runner; buffered, 1
+	// A number of times this node has failed in a row
+	failCount int
+
+	// Channel for shutting down the runner; buffered, 1
 	done chan bool
 }
 
-// Basic info on a remote session where the message was created
+// ClusterSess is a basic info on a remote session where the message was created.
 type ClusterSess struct {
 	// IP address of the client. For long polling this is the IP of the last poll
 	RemoteAddr string
@@ -59,19 +70,42 @@ type ClusterSess struct {
 	// ID of the current user or 0
 	Uid types.Uid
 
+	// User's authentication level
+	AuthLvl auth.Level
+
 	// Protocol version of the client: ((major & 0xff) << 8) | (minor & 0xff)
 	Ver int
+
+	// Human language of the client
+	Lang string
+
+	// Device ID
+	DeviceID string
+
+	// Device platform: "web", "ios", "android"
+	Platform string
 
 	// Session ID
 	Sid string
 }
 
-// Proxy to Master request message
+// ClusterReq is a Proxy to Master request message.
 type ClusterReq struct {
-	// Name of the node which sent the request
+	// Name of the node sending this request
 	Node string
 
-	Msg *ClientComMessage
+	// Ring hash signature of the node sending this request
+	// Signature must match the signature of the receiver, otherwise the
+	// Cluster is desynchronized.
+	Signature string
+
+	Pkt *ClientComMessage
+
+	// Root user may send messages on behalf of other users.
+	OnBahalfOf string
+	// AuthLevel of the user specified by root.
+	AuthLvl int
+
 	// Expanded (routable) topic name
 	RcptTo string
 	// Originating session
@@ -80,7 +114,7 @@ type ClusterReq struct {
 	SessGone bool
 }
 
-// Master to Proxy response message
+// ClusterResp is a Master to Proxy response message.
 type ClusterResp struct {
 	Msg []byte
 	// Session ID to forward message to, if any.
@@ -88,9 +122,19 @@ type ClusterResp struct {
 }
 
 // Handle outbound node communication: read messages from the channel, forward to remote nodes.
-// FIXME(gene): this will drain the outbound queue in case of a failure. Maybe it's a good thing, maybe not.
+// FIXME(gene): this will drain the outbound queue in case of a failure: all unprocessed messages will be dropped.
+// Maybe it's a good thing, maybe not.
 func (n *ClusterNode) reconnect() {
 	var reconnTicker *time.Ticker
+
+	// Avoid parallel reconnection threads
+	n.lock.Lock()
+	if n.reconnecting {
+		n.lock.Unlock()
+		return
+	}
+	n.reconnecting = true
+	n.lock.Unlock()
 
 	var count = 0
 	var err error
@@ -102,11 +146,12 @@ func (n *ClusterNode) reconnect() {
 			}
 			n.lock.Lock()
 			n.connected = true
+			n.reconnecting = false
 			n.lock.Unlock()
 			log.Printf("cluster: connection to '%s' established", n.name)
 			return
 		} else if count == 0 {
-			reconnTicker = time.NewTicker(DEFAULT_CLUSTER_RECONNECT)
+			reconnTicker = time.NewTicker(defaultClusterReconnect)
 		}
 
 		count++
@@ -118,21 +163,25 @@ func (n *ClusterNode) reconnect() {
 			// Shutting down
 			log.Printf("cluster: node '%s' shutdown started", n.name)
 			reconnTicker.Stop()
-			n.endpoint.Close()
+			if n.endpoint != nil {
+				n.endpoint.Close()
+			}
+			n.lock.Lock()
 			n.connected = false
+			n.reconnecting = false
+			n.lock.Unlock()
 			log.Printf("cluster: node '%s' shut down completed", n.name)
 			return
 		}
 	}
 }
 
-func (n *ClusterNode) call(proc string, msg interface{}) error {
+func (n *ClusterNode) call(proc string, msg, resp interface{}) error {
 	if !n.connected {
-		return errors.New("cluster node not connected")
+		return errors.New("cluster: node '" + n.name + "' not connected")
 	}
 
-	var unused bool
-	if err := n.endpoint.Call(proc, msg, &unused); err != nil {
+	if err := n.endpoint.Call(proc, msg, resp); err != nil {
 		log.Printf("cluster: call failed to '%s' [%s]", n.name, err)
 
 		n.lock.Lock()
@@ -145,40 +194,98 @@ func (n *ClusterNode) call(proc string, msg interface{}) error {
 		return err
 	}
 
-	log.Printf("cluster: Cluster.Master to '%s' successful", n.name)
 	return nil
+}
+
+func (n *ClusterNode) callAsync(proc string, msg, resp interface{}, done chan *rpc.Call) *rpc.Call {
+	if done != nil && cap(done) == 0 {
+		log.Panic("cluster: RPC done channel is unbuffered")
+	}
+
+	if !n.connected {
+		call := &rpc.Call{
+			ServiceMethod: proc,
+			Args:          msg,
+			Reply:         resp,
+			Error:         errors.New("cluster: node '" + n.name + "' not connected"),
+			Done:          done,
+		}
+		if done != nil {
+			done <- call
+		}
+		return call
+	}
+
+	myDone := make(chan *rpc.Call, 1)
+	go func() {
+		select {
+		case call := <-myDone:
+			if call.Error != nil {
+				n.lock.Lock()
+				if n.connected {
+					n.endpoint.Close()
+					n.connected = false
+					go n.reconnect()
+				}
+				n.lock.Unlock()
+			}
+
+			if done != nil {
+				done <- call
+			}
+		}
+	}()
+
+	call := n.endpoint.Go(proc, msg, resp, myDone)
+	call.Done = done
+
+	return call
 }
 
 // Proxy forwards message to master
 func (n *ClusterNode) forward(msg *ClusterReq) error {
 	log.Printf("cluster: forwarding request to node '%s'", n.name)
 	msg.Node = globals.cluster.thisNodeName
-	return n.call("Cluster.Master", msg)
+	rejected := false
+	err := n.call("Cluster.Master", msg, &rejected)
+	if err == nil && rejected {
+		err = errors.New("cluster: master node out of sync")
+	}
+	return err
 }
 
 // Master responds to proxy
 func (n *ClusterNode) respond(msg *ClusterResp) error {
 	log.Printf("cluster: replying to node '%s'", n.name)
-	return n.call("Cluster.Proxy", msg)
+	unused := false
+	return n.call("Cluster.Proxy", msg, &unused)
 }
 
+// Cluster is the representation of the cluster.
 type Cluster struct {
-	// List of RPC endpoints
+	// Cluster nodes with RPC endpoints
 	nodes map[string]*ClusterNode
+	// Name of the local node
+	thisNodeName string
+
+	// Resolved address to listed on
+	listenOn string
+
 	// Socket for inbound connections
 	inbound *net.TCPListener
 	// Ring hash for mapping topic names to nodes
 	ring *rh.Ring
-	// Name of the local node
-	thisNodeName string
+
+	// Failover parameters. Could be nil if failover is not enabled
+	fo *clusterFailover
 }
 
-// Cluster.Master at topic's master node receives C2S messages from topic's proxy nodes.
+// Master at topic's master node receives C2S messages from topic's proxy nodes.
 // The message is treated like it came from a session: find or create a session locally,
-// dispatch the message to it like it came from a normal session.
+// dispatch the message to it like it came from a normal ws/lp connection.
 // Called by a remote node.
-func (Cluster) Master(msg *ClusterReq, unused *bool) error {
-	log.Printf("cluster: Master request received from %s node", msg.Node)
+func (c *Cluster) Master(msg *ClusterReq, rejected *bool) error {
+	log.Printf("cluster: Master request received from node '%s'", msg.Node)
 
 	// Find the local session associated with the given remote session.
 	sess := globals.sessionStore.Get(msg.Sess.Sid)
@@ -188,7 +295,7 @@ func (Cluster) Master(msg *ClusterReq, unused *bool) error {
 		if sess != nil {
 			sess.stop <- nil
 		}
-	} else {
+	} else if msg.Signature == c.ring.Signature() {
 		// This cluster member received a request for a topic it owns.
 
 		if sess == nil {
@@ -199,36 +306,45 @@ func (Cluster) Master(msg *ClusterReq, unused *bool) error {
 				return nil
 			}
 
-			sess = globals.sessionStore.Create(node, msg.Sess.Sid)
+			sess, _ = globals.sessionStore.NewSession(node, msg.Sess.Sid)
 			go sess.rpcWriteLoop()
 		}
 
 		// Update session params which may have changed since the last call.
 		sess.uid = msg.Sess.Uid
+		sess.authLvl = msg.Sess.AuthLvl
 		sess.ver = msg.Sess.Ver
 		sess.userAgent = msg.Sess.UserAgent
 		sess.remoteAddr = msg.Sess.RemoteAddr
+		sess.lang = msg.Sess.Lang
+		sess.deviceID = msg.Sess.DeviceID
+		sess.platf = msg.Sess.Platform
 
-		// Dispatch remote message to local session.
-		sess.dispatch(msg.Msg)
+		// Dispatch remote message to a local session.
+		msg.Pkt.from = msg.OnBahalfOf
+		msg.Pkt.authLvl = msg.AuthLvl
+		sess.dispatch(msg.Pkt)
+	} else {
+		// Reject the request: wrong signature, cluster is out of sync.
+		*rejected = true
 	}
 
 	return nil
 }
 
-// Proxy recieves messages from the master node addressed to a specific local session.
+// Proxy receives messages from the master node addressed to a specific local session.
 // Called by Session.writeRPC
 func (Cluster) Proxy(msg *ClusterResp, unused *bool) error {
-	log.Printf("cluster: Proxy response received for session %s", msg.FromSID)
+	log.Println("cluster: response from Master for session", msg.FromSID)
 
 	// This cluster member received a response from topic owner to be forwarded to a session
 	// Find appropriate session, send the message to it
 	if sess := globals.sessionStore.Get(msg.FromSID); sess != nil {
-		select {
-		case sess.send <- msg.Msg:
-		case <-time.After(time.Millisecond * 10):
+		if !sess.queueOutBytes(msg.Msg) {
 			log.Println("cluster.Proxy: timeout")
 		}
+	} else {
+		log.Println("cluster: master response for unknown session", msg.FromSID)
 	}
 
 	return nil
@@ -238,11 +354,16 @@ func (Cluster) Proxy(msg *ClusterResp, unused *bool) error {
 func (c *Cluster) nodeForTopic(topic string) *ClusterNode {
 	key := c.ring.Get(topic)
 	if key == c.thisNodeName {
+		log.Println("cluster: request to route to self")
 		// Do not route to self
 		return nil
-	} else {
-		return globals.cluster.nodes[key]
 	}
+
+	node := globals.cluster.nodes[key]
+	if node == nil {
+		log.Println("cluster: no node for topic", topic, key)
+	}
+	return node
 }
 
 func (c *Cluster) isRemoteTopic(topic string) bool {
@@ -258,7 +379,7 @@ func (c *Cluster) routeToTopic(msg *ClientComMessage, topic string, sess *Sessio
 	// Find the cluster node which owns the topic, then forward to it.
 	n := c.nodeForTopic(topic)
 	if n == nil {
-		log.Fatal("attempt to route to non-existent node")
+		return errors.New("attempt to route to non-existent node")
 	}
 
 	// Save node name: it's need in order to inform relevant nodes when the session is disconnected
@@ -269,25 +390,32 @@ func (c *Cluster) routeToTopic(msg *ClientComMessage, topic string, sess *Sessio
 
 	return n.forward(
 		&ClusterReq{
-			Node:   c.thisNodeName,
-			Msg:    msg,
-			RcptTo: topic,
+			Node:       c.thisNodeName,
+			Signature:  c.ring.Signature(),
+			Pkt:        msg,
+			OnBahalfOf: msg.from,
+			AuthLvl:    msg.authLvl,
+			RcptTo:     topic,
 			Sess: &ClusterSess{
 				Uid:        sess.uid,
+				AuthLvl:    sess.authLvl,
 				RemoteAddr: sess.remoteAddr,
 				UserAgent:  sess.userAgent,
 				Ver:        sess.ver,
+				Lang:       sess.lang,
+				DeviceID:   sess.deviceID,
+				Platform:   sess.platf,
 				Sid:        sess.sid}})
 }
 
-// Forward client message to the Master (cluster node which owns the topic)
+// Session terminated at origin. Inform remote Master nodes that the session is gone.
 func (c *Cluster) sessionGone(sess *Session) error {
 	if c == nil {
 		return nil
 	}
 
 	// Save node name: it's need in order to inform relevant nodes when the session is disconnected
-	for name, _ := range sess.nodes {
+	for name := range sess.nodes {
 		n := c.nodes[name]
 		if n != nil {
 			return n.forward(
@@ -305,64 +433,72 @@ func (c *Cluster) sessionGone(sess *Session) error {
 	return nil
 }
 
-func clusterInit(configString json.RawMessage) {
+// Returns snowflake worker id
+func clusterInit(configString json.RawMessage, self *string) int {
 	if globals.cluster != nil {
-		log.Fatal("Cluster already initialized")
+		log.Fatal("Cluster already initialized.")
 	}
 
 	// This is a standalone server, not initializing
-	if configString == nil || len(configString) == 0 {
+	if len(configString) == 0 {
 		log.Println("Running as a standalone server.")
-		return
+		return 1
 	}
 
-	var config ClusterConfig
+	var config clusterConfig
 	if err := json.Unmarshal(configString, &config); err != nil {
 		log.Fatal(err)
 	}
 
+	thisName := *self
+	if thisName == "" {
+		thisName = config.ThisName
+	}
+
+	// Name of the current node is not specified - disable clustering
+	if thisName == "" {
+		log.Println("Running as a standalone server.")
+		return 1
+	}
+
+	gob.Register([]interface{}{})
+	gob.Register(map[string]interface{}{})
+
 	globals.cluster = &Cluster{
-		thisNodeName: config.ThisName,
-		ring:         rh.New(CLUSTER_HASH_REPLICAS, nil),
+		thisNodeName: thisName,
 		nodes:        make(map[string]*ClusterNode)}
-	ringKeys := make([]string, 0, len(config.Nodes))
 
+	var nodeNames []string
 	for _, host := range config.Nodes {
-		ringKeys = append(ringKeys, host.Name)
+		nodeNames = append(nodeNames, host.Name)
 
-		if host.Name == globals.cluster.thisNodeName {
+		if host.Name == thisName {
+			globals.cluster.listenOn = host.Addr
 			// Don't create a cluster member for this local instance
 			continue
 		}
 
-		n := ClusterNode{address: host.Addr, name: host.Name}
-		n.done = make(chan bool, 1)
-		go n.reconnect()
+		n := ClusterNode{
+			address: host.Addr,
+			name:    host.Name,
+			done:    make(chan bool, 1)}
 
 		globals.cluster.nodes[host.Name] = &n
 	}
 
 	if len(globals.cluster.nodes) == 0 {
-		log.Fatal("Invalid cluster size: 0")
+		// Cluster needs at least two nodes.
+		log.Fatal("Invalid cluster size: 1")
 	}
 
-	globals.cluster.ring.Add(ringKeys...)
-
-	addr, err := net.ResolveTCPAddr("tcp", config.ListenOn)
-	if err != nil {
-		log.Fatal(err)
+	if !globals.cluster.failoverInit(config.Failover) {
+		globals.cluster.rehash(nil)
 	}
 
-	globals.cluster.inbound, err = net.ListenTCP("tcp", addr)
-	if err != nil {
-		log.Fatal(err)
-	}
+	sort.Strings(nodeNames)
+	workerId := sort.SearchStrings(nodeNames, thisName) + 1
 
-	rpc.Register(globals.cluster)
-	go rpc.Accept(globals.cluster.inbound)
-
-	log.Printf("Cluster of %d nodes initialized, node '%s' listening on [%s]", len(globals.cluster.nodes)+1,
-		globals.cluster.thisNodeName, config.ListenOn)
+	return workerId
 }
 
 // This is a session handler at a master node: forward messages from the master to the session origin.
@@ -372,24 +508,21 @@ func (sess *Session) rpcWriteLoop() {
 		log.Println("writeRPC - stop")
 		sess.closeRPC()
 		globals.sessionStore.Delete(sess)
-		for _, sub := range sess.subs {
-			// sub.done is the same as topic.unreg
-			sub.done <- &sessionLeave{sess: sess, unsub: false}
-		}
+		sess.unsubAll()
 	}()
 	var unused bool
 
 	for {
 		select {
 		case msg, ok := <-sess.send:
-			if !ok {
+			if !ok || sess.clnode.endpoint == nil {
 				// channel closed
 				return
 			}
 			// The error is returned if the remote node is down. Which means the remote
 			// session is also disconnected.
-			if err := sess.rpcnode.endpoint.Call("Cluster.Proxy",
-				&ClusterResp{Msg: msg, FromSID: sess.sid}, &unused); err != nil {
+			if err := sess.clnode.call("Cluster.Proxy",
+				&ClusterResp{Msg: msg.([]byte), FromSID: sess.sid}, &unused); err != nil {
 
 				log.Println("sess.writeRPC: " + err.Error())
 				return
@@ -397,38 +530,95 @@ func (sess *Session) rpcWriteLoop() {
 		case msg := <-sess.stop:
 			// Shutdown is requested, don't care if the message is delivered
 			if msg != nil {
-				sess.rpcnode.endpoint.Call("Cluster.Proxy", &ClusterResp{Msg: msg, FromSID: sess.sid},
+				sess.clnode.call("Cluster.Proxy", &ClusterResp{Msg: msg.([]byte), FromSID: sess.sid},
 					&unused)
 			}
 			return
 
 		case topic := <-sess.detach:
-			delete(sess.subs, topic)
-			if len(sess.subs) == 0 {
-				// TODO(gene): the session is not connected to any topics here, shut it down
-			}
+			sess.delSub(topic)
 		}
 	}
 }
 
 // Proxied session is being closed at the Master node
-func (s *Session) closeRPC() {
-	if s.proto == RPC {
-		// Tell proxy node to shut down the proxied session
-		//s.rpcnode.respond()
+func (sess *Session) closeRPC() {
+	if sess.proto == CLUSTER {
+		log.Println("cluster: session closed at master")
 	}
+}
+
+// Start accepting connections.
+func (c *Cluster) start() {
+	addr, err := net.ResolveTCPAddr("tcp", c.listenOn)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	c.inbound, err = net.ListenTCP("tcp", addr)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, n := range c.nodes {
+		go n.reconnect()
+	}
+
+	if c.fo != nil {
+		go c.run()
+	}
+
+	err = rpc.Register(c)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	go rpc.Accept(c.inbound)
+
+	log.Printf("Cluster of %d nodes initialized, node '%s' listening on [%s]", len(globals.cluster.nodes)+1,
+		globals.cluster.thisNodeName, c.listenOn)
 }
 
 func (c *Cluster) shutdown() {
 	if globals.cluster == nil {
 		return
 	}
-
-	globals.cluster.inbound.Close()
-	for _, n := range globals.cluster.nodes {
-		n.done <- true
-	}
 	globals.cluster = nil
 
-	log.Println("cluster shut down")
+	c.inbound.Close()
+
+	if c.fo != nil {
+		c.fo.done <- true
+	}
+
+	for _, n := range c.nodes {
+		n.done <- true
+	}
+
+	log.Println("Cluster shut down")
+}
+
+// Recalculate the ring hash using provided list of nodes or only nodes in a non-failed state.
+// Returns the list of nodes used for ring hash.
+func (c *Cluster) rehash(nodes []string) []string {
+	ring := rh.New(clusterHashReplicas, nil)
+
+	var ringKeys []string
+
+	if nodes == nil {
+		for _, node := range c.nodes {
+			ringKeys = append(ringKeys, node.name)
+		}
+		ringKeys = append(ringKeys, c.thisNodeName)
+	} else {
+		for _, name := range nodes {
+			ringKeys = append(ringKeys, name)
+		}
+	}
+	ring.Add(ringKeys...)
+
+	c.ring = ring
+
+	return ringKeys
 }
